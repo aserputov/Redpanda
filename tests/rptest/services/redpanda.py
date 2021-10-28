@@ -646,3 +646,38 @@ class RedpandaService(Service):
 
     def cov_enabled(self):
         return self._context.globals.get(self.COV_KEY, self.DEFAULT_COV_OPT)
+
+    def transfer_partition_leadership(self,
+                                      topic,
+                                      partition,
+                                      target,
+                                      timeout_sec=30):
+        kc = KafkaCat(self)
+
+        # source / target nodes
+        target = self.idx(target) if isinstance(target,
+                                                ClusterNode) else target
+        source, _ = kc.get_partition_leader(topic, partition, timeout_sec=30)
+        self.logger.debug(
+            f"Transferring leadership source {source} target {target}")
+
+        # build admin url
+        source_node = self.get_node(source)
+        url = "http://{}:9644/v1/partitions/kafka/{}/{}/transfer_leadership?target={}".format(
+            source_node.account.hostname, topic, partition, target)
+
+        def try_transfer():
+            self.logger.debug(url)
+            res = requests.post(url)
+            self.logger.debug(res.text)
+            for _ in range(5):  # give it some time
+                time.sleep(1)
+                leader = kc.get_partition_leader(topic, partition)
+                if leader[0] == target:
+                    return True
+            return False
+
+        wait_until(try_transfer,
+                   timeout_sec=timeout_sec,
+                   backoff_sec=5,
+                   err_msg="Transfer did not complete")
