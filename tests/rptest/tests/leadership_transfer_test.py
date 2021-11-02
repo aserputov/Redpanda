@@ -49,39 +49,17 @@ class LeadershipTransferTest(RedpandaTest):
             f"Transfering leader from {partition['leader']} to {target_node_id}"
         )
 
-        # build the transfer url
-        meta = kc.metadata()
-        brokers = meta["brokers"]
-        source_broker = next(
-            filter(lambda b: b["id"] == partition["leader"], brokers))
-        target_broker = next(
-            filter(lambda b: b["id"] == target_node_id, brokers))
-        self.logger.debug(f"Source broker {source_broker}")
-        self.logger.debug(f"Target broker {target_broker}")
-        host = source_broker["name"]
-        host = host.split(":")[0]
-        partition_id = partition["partition"]
-        url = "http://{}:9644/v1/partitions/kafka/{}/{}/transfer_leadership?target={}".format(
-            host, self.topic, partition["partition"], target_node_id)
+        # assert leadership is being moved some where else
+        leader = kc.get_partition_leader(self.topic, partition["partition"])
+        assert leader[0] != target_node_id
 
-        def try_transfer():
-            self.logger.debug(url)
-            res = requests.post(url)
-            self.logger.debug(res.text)
-            for _ in range(3):  # just give it a moment
-                time.sleep(1)
-                meta = kc.metadata()
-                partition = next(
-                    filter(lambda p: p["partition"] == partition_id,
-                           meta["topics"][0]["partitions"]))
-                if partition["leader"] == target_node_id:
-                    return True
-            return False
+        self.redpanda.transfer_partition_leadership(self.topic,
+                                                    partition["partition"],
+                                                    target_node_id)
 
-        wait_until(lambda: try_transfer(),
-                   timeout_sec=30,
-                   backoff_sec=5,
-                   err_msg="Transfer did not complete")
+        # assert that leadership was moved to the target
+        leader = kc.get_partition_leader(self.topic, partition["partition"])
+        assert leader[0] == target_node_id
 
     def _get_partition(self, kc):
         partition = [None]

@@ -34,6 +34,22 @@ from kafka import KafkaAdminClient
 Partition = collections.namedtuple('Partition',
                                    ['index', 'leader', 'replicas'])
 
+MetricSample = collections.namedtuple(
+    'MetricSample', ['family', 'sample', 'node', 'value', 'labels'])
+
+
+class MetricSamples:
+    def __init__(self, samples):
+        self.samples = samples
+
+    def label_filter(self, labels):
+        def f(sample):
+            for key, value in labels.items():
+                assert key in sample.labels
+                return sample.labels[key] == value
+
+        return MetricSamples([s for s in filter(f, self.samples)])
+
 
 def one_or_many(value):
     """
@@ -490,6 +506,50 @@ class RedpandaService(Service):
         assert resp.status_code == 200
         return text_string_to_metric_families(resp.text)
 
+    def metrics_sample(self, sample_pattern, nodes=None):
+        """
+        Query metrics for a single sample using fuzzy name matching. This
+        interface matches the sample pattern against sample names, and requires
+        that exactly one (family, sample) match the query. All values for the
+        sample across the requested set of nodes are returned in a flat array.
+
+        An exception will be raised unless exactly one (family, sample) matches.
+
+        Example:
+
+           The query:
+
+              redpanda.metrics_sample("under_replicated")
+
+           will return an array containing MetricSample instances for each node and
+           core/shard in the cluster. Each entry will correspond to a value from:
+
+              family = vectorized_cluster_partition_under_replicated_replicas
+              sample = vectorized_cluster_partition_under_replicated_replicas
+        """
+        nodes = nodes or self.nodes
+        found_sample = None
+        sample_values = []
+        for node in nodes:
+            metrics = self.metrics(node)
+            for family in metrics:
+                for sample in family.samples:
+                    if sample_pattern not in sample.name:
+                        continue
+                    if not found_sample:
+                        found_sample = (family.name, sample.name)
+                    if found_sample != (family.name, sample.name):
+                        raise Exception(
+                            f"More than one metric matched '{sample_pattern}'. Found {found_sample} and {(family.name, sample.name)}"
+                        )
+                    sample_values.append(
+                        MetricSample(family.name, sample.name, node,
+                                     sample.value, sample.labels))
+        if not sample_values:
+            raise Exception(
+                f"No metric sample matching '{sample_pattern}' found")
+        return MetricSamples(sample_values)
+
     def read_configuration(self, node):
         assert node in self._started
         with self.config_file_lock:
@@ -586,3 +646,38 @@ class RedpandaService(Service):
 
     def cov_enabled(self):
         return self._context.globals.get(self.COV_KEY, self.DEFAULT_COV_OPT)
+
+    def transfer_partition_leadership(self,
+                                      topic,
+                                      partition,
+                                      target,
+                                      timeout_sec=30):
+        kc = KafkaCat(self)
+
+        # source / target nodes
+        target = self.idx(target) if isinstance(target,
+                                                ClusterNode) else target
+        source, _ = kc.get_partition_leader(topic, partition, timeout_sec=30)
+        self.logger.debug(
+            f"Transferring leadership source {source} target {target}")
+
+        # build admin url
+        source_node = self.get_node(source)
+        url = "http://{}:9644/v1/partitions/kafka/{}/{}/transfer_leadership?target={}".format(
+            source_node.account.hostname, topic, partition, target)
+
+        def try_transfer():
+            self.logger.debug(url)
+            res = requests.post(url)
+            self.logger.debug(res.text)
+            for _ in range(5):  # give it some time
+                time.sleep(1)
+                leader = kc.get_partition_leader(topic, partition)
+                if leader[0] == target:
+                    return True
+            return False
+
+        wait_until(try_transfer,
+                   timeout_sec=timeout_sec,
+                   backoff_sec=5,
+                   err_msg="Transfer did not complete")
